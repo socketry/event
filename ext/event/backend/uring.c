@@ -496,3 +496,92 @@ void Init_Event_Backend_URing(VALUE Event_Backend) {
 	
 	rb_define_method(Event_Backend_URing, "process_wait", Event_Backend_URing_process_wait, 3);
 }
+
+static int _io_uring_get_cqe_with_availables(struct io_uring *ring, struct io_uring_cqe **cqe_ptr,
+			     struct get_data *data, unsigned *nr_available)
+{
+	struct io_uring_cqe *cqe = NULL;
+	int err;
+
+	do {
+		bool need_enter = false;
+		bool cq_overflow_flush = false;
+		unsigned flags = 0;
+		int ret;
+
+		err = __io_uring_peek_cqe(ring, &cqe, nr_available);
+		if (err)
+			break;
+		if (!cqe && !data->wait_nr && !data->submit) {
+			if (!cq_ring_needs_flush(ring)) {
+				err = -EAGAIN;
+				break;
+			}
+			cq_overflow_flush = true;
+		}
+		if (data->wait_nr > nr_available || cq_overflow_flush) {
+			flags = IORING_ENTER_GETEVENTS | data->get_flags;
+			need_enter = true;
+		}
+		if (data->submit) {
+			sq_ring_needs_enter(ring, &flags);
+			need_enter = true;
+		}
+		if (!need_enter)
+			break;
+
+		ret = __sys_io_uring_enter2(ring->ring_fd, data->submit,
+				data->wait_nr, flags, data->arg,
+				data->sz);
+		if (ret < 0) {
+			err = -errno;
+			break;
+		}
+
+		data->submit -= ret;
+		if (cqe)
+			break;
+	} while (1);
+
+	*cqe_ptr = cqe;
+	return err;
+}
+
+int __io_uring_get_cqe(struct io_uring *ring, struct io_uring_cqe **cqe_ptr,
+		       unsigned submit, unsigned wait_nr, sigset_t *sigmask, unsigned *nr_available)
+{
+	struct get_data data = {
+		.submit		= submit,
+		.wait_nr 	= wait_nr,
+		.get_flags	= 0,
+		.sz		= _NSIG / 8,
+		.arg		= sigmask,
+	};
+
+	return _io_uring_get_cqe_with_availables(ring, cqe_ptr, &data, nr_available);
+}
+
+static int io_uring_wait_for_events(struct io_uring *ring, struct io_uring_cqe **cqe_ptr, unsigned *nr_available, struct __kernel_timespec *ts) {
+	int ret = 0;
+	unsigned to_submit = 0;
+
+	// It should submit any pending SQE.
+	ret = io_uring_submit(ring);
+	if (ret < 0) return ret;
+
+	if (ts) {
+		struct io_uring_sqe *sqe;
+		int ret;
+
+		sqe = io_uring_get_sqe(ring);
+		if (!sqe) return -EAGAIN;
+		// 	It should wait for at least one event.
+		io_uring_prep_timeout(sqe, ts, 1, 0);
+		sqe->user_data = LIBURING_UDATA_TIMEOUT;
+		to_submit = __io_uring_flush_sq(ring);
+	}
+	
+	// It should return current pending events.
+	ret = __io_uring_get_cqe_with_availables(ring, cqe_ptr, to_submit, 1, NULL, nr_available);
+	return ret;
+}
