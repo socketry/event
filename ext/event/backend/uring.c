@@ -25,6 +25,8 @@
 #include <poll.h>
 #include <time.h>
 
+#include <pthread.h>
+
 #include "pidfd.c"
 
 #include <ruby/io/buffer.h>
@@ -37,6 +39,11 @@ enum {URING_MAX_EVENTS = 128};
 struct Event_Backend_URing {
 	VALUE loop;
 	struct io_uring ring;
+	
+	pthread_t *thread;
+	pthread_t _thread;
+	pthread_cond_t submit;
+	pthread_mutex_t guard;
 };
 
 void Event_Backend_URing_Type_mark(void *_data)
@@ -50,6 +57,16 @@ void close_internal(struct Event_Backend_URing *data) {
 	if (data->ring.ring_fd >= 0) {
 		io_uring_queue_exit(&data->ring);
 		data->ring.ring_fd = -1;
+	}
+	
+	if (data->thread) {
+		pthread_cancel(data->thread);
+		pthread_join(data->thread, NULL);
+		
+		pthread_mutex_destroy(&data->guard, NULL);
+		pthread_cond_destroy(&data->submit, NULL);
+		
+		data->thread = NULL;
 	}
 }
 
@@ -85,7 +102,65 @@ VALUE Event_Backend_URing_allocate(VALUE self) {
 	data->loop = Qnil;
 	data->ring.ring_fd = -1;
 	
+	data->thread = NULL;
+	
 	return instance;
+}
+
+static
+void *uring_submission_thread_cleanup(void *_data) {
+	struct Event_Backend_URing *data = data;
+	
+	pthread_mutex_unlock(data->guard);
+	
+	return NULL;
+}
+
+static
+void *uring_submission_thread(void *_data) {
+	struct Event_Backend_URing *data = data;
+	
+	pthread_mutex_lock(data->guard);
+	pthread_cleanup_push(uring_submission_thread_cleanup, _data);
+	
+	while (true) {
+		pthread_cond_wait(data->submit, data->guard);
+		io_uring_submit(&data->ring);
+	}
+	
+	return NULL;
+}
+
+static
+void start_submission_thread(struct Event_Backend_URing *data) {
+	rb_update_max_fd(data->ring.ring_fd);
+	
+	pthread_mutex_init(&data->guard, NULL);
+	pthread_cond_init(&data->submit, NULL);
+	
+	int error = pthread_create(&data->_thread, &uring_submission_thread, data);
+	
+	if (!error) {
+		data->thread = &data->_thread;
+	} else {
+		rb_sys_fail("start_submission_thread:pthread_create");
+	}
+}
+
+inline static
+void submit_lock(struct Event_Backend_URing *data) {
+	pthread_mutex_lock(data->guard);
+}
+
+inline static
+void submit_unlock(struct Event_Backend_URing *data) {
+	pthread_mutex_unlock(data->guard);
+}
+
+inline static
+void submit_unlock_signal(struct Event_Backend_URing *data) {
+	pthread_mutex_unlock(data->guard);
+	pthread_cond_signal(data->submit);
 }
 
 VALUE Event_Backend_URing_initialize(VALUE self, VALUE loop) {
@@ -97,10 +172,10 @@ VALUE Event_Backend_URing_initialize(VALUE self, VALUE loop) {
 	int result = io_uring_queue_init(URING_ENTRIES, &data->ring, 0);
 	
 	if (result < 0) {
-		rb_syserr_fail(-result, "io_uring_queue_init");
+		rb_syserr_fail(-result, "Event_Backend_URing_initialize:io_uring_queue_init");
 	}
 	
-	rb_update_max_fd(data->ring.ring_fd);
+	start_submission_thread(data);
 	
 	return self;
 }
@@ -165,11 +240,13 @@ VALUE Event_Backend_URing_process_wait(VALUE self, VALUE fiber, VALUE pid, VALUE
 	process_wait_arguments.descriptor = pidfd_open(process_wait_arguments.pid, 0);
 	rb_update_max_fd(process_wait_arguments.descriptor);
 	
+	submit_lock(data);
 	struct io_uring_sqe *sqe = io_get_sqe(data);
 	assert(sqe);
 	
 	io_uring_prep_poll_add(sqe, process_wait_arguments.descriptor, POLLIN|POLLHUP|POLLERR);
 	io_uring_sqe_set_data(sqe, (void*)fiber);
+	submit_unlock_signal(data);
 	
 	return rb_ensure(process_wait_transfer, (VALUE)&process_wait_arguments, process_wait_ensure, (VALUE)&process_wait_arguments);
 }
@@ -210,6 +287,7 @@ VALUE io_wait_rescue(VALUE _arguments, VALUE exception) {
 	struct io_wait_arguments *arguments = (struct io_wait_arguments *)_arguments;
 	struct Event_Backend_URing *data = arguments->data;
 	
+	submit_lock(data);
 	struct io_uring_sqe *sqe = io_get_sqe(data);
 	assert(sqe);
 	
@@ -217,6 +295,7 @@ VALUE io_wait_rescue(VALUE _arguments, VALUE exception) {
 	
 	io_uring_prep_poll_remove(sqe, (void*)arguments->fiber);
 	io_uring_submit(&data->ring);
+	submit_unlock(data);
 	
 	rb_exc_raise(exception);
 };
@@ -240,6 +319,8 @@ VALUE Event_Backend_URing_io_wait(VALUE self, VALUE fiber, VALUE io, VALUE event
 	TypedData_Get_Struct(self, struct Event_Backend_URing, &Event_Backend_URing_Type, data);
 	
 	int descriptor = Event_Backend_io_descriptor(io);
+	
+	submit_lock(data);
 	struct io_uring_sqe *sqe = io_get_sqe(data);
 	assert(sqe);
 	
@@ -251,6 +332,7 @@ VALUE Event_Backend_URing_io_wait(VALUE self, VALUE fiber, VALUE io, VALUE event
 	io_uring_sqe_set_data(sqe, (void*)fiber);
 	// fprintf(stderr, "io_uring_submit\n");
 	// io_uring_submit(&data->ring);
+	submit_unlock(data);
 	
 	struct io_wait_arguments io_wait_arguments = {
 		.data = data,
@@ -264,12 +346,14 @@ VALUE Event_Backend_URing_io_wait(VALUE self, VALUE fiber, VALUE io, VALUE event
 #ifdef HAVE_RUBY_IO_BUFFER_H
 
 static int io_read(struct Event_Backend_URing *data, VALUE fiber, int descriptor, char *buffer, size_t length) {
+	submit_lock(data);
 	struct io_uring_sqe *sqe = io_get_sqe(data);
 	assert(sqe);
 	
 	io_uring_prep_read(sqe, descriptor, buffer, length, 0);
 	io_uring_sqe_set_data(sqe, (void*)fiber);
-	io_uring_submit(&data->ring);
+	// io_uring_submit(&data->ring);
+	submit_unlock_signal(data);
 
 	VALUE result = Event_Backend_fiber_transfer(data->loop);
 	return RB_NUM2INT(result);
@@ -310,12 +394,14 @@ VALUE Event_Backend_URing_io_read(VALUE self, VALUE fiber, VALUE io, VALUE buffe
 
 static
 int io_write(struct Event_Backend_URing *data, VALUE fiber, int descriptor, char *buffer, size_t length) {
+	submit_lock(data);
 	struct io_uring_sqe *sqe = io_get_sqe(data);
 	assert(sqe);
 	
 	io_uring_prep_write(sqe, descriptor, buffer, length, 0);
 	io_uring_sqe_set_data(sqe, (void*)fiber);
-	io_uring_submit(&data->ring);
+	// io_uring_submit(&data->ring);
+	submit_unlock_signal(data);
 	
 	return NUM2INT(Event_Backend_fiber_transfer(data->loop));
 }
