@@ -40,8 +40,7 @@ struct Event_Backend_URing {
 	VALUE loop;
 	struct io_uring ring;
 	
-	pthread_t *thread;
-	pthread_t _thread;
+	pthread_t thread;
 	pthread_cond_t submit;
 	pthread_mutex_t guard;
 };
@@ -63,10 +62,10 @@ void close_internal(struct Event_Backend_URing *data) {
 		pthread_cancel(data->thread);
 		pthread_join(data->thread, NULL);
 		
-		pthread_mutex_destroy(&data->guard, NULL);
-		pthread_cond_destroy(&data->submit, NULL);
+		pthread_mutex_destroy(&data->guard);
+		pthread_cond_destroy(&data->submit);
 		
-		data->thread = NULL;
+		data->thread = 0;
 	}
 }
 
@@ -102,31 +101,31 @@ VALUE Event_Backend_URing_allocate(VALUE self) {
 	data->loop = Qnil;
 	data->ring.ring_fd = -1;
 	
-	data->thread = NULL;
+	data->thread = 0;
 	
 	return instance;
 }
 
 static
-void *uring_submission_thread_cleanup(void *_data) {
+void uring_submission_thread_cleanup(void *_data) {
 	struct Event_Backend_URing *data = data;
 	
-	pthread_mutex_unlock(data->guard);
-	
-	return NULL;
+	pthread_mutex_unlock(&data->guard);
 }
 
 static
 void *uring_submission_thread(void *_data) {
 	struct Event_Backend_URing *data = data;
 	
-	pthread_mutex_lock(data->guard);
+	pthread_mutex_lock(&data->guard);
 	pthread_cleanup_push(uring_submission_thread_cleanup, _data);
 	
 	while (true) {
-		pthread_cond_wait(data->submit, data->guard);
+		pthread_cond_wait(&data->submit, &data->guard);
 		io_uring_submit(&data->ring);
 	}
+	
+	pthread_cleanup_pop(1);
 	
 	return NULL;
 }
@@ -138,10 +137,10 @@ void start_submission_thread(struct Event_Backend_URing *data) {
 	pthread_mutex_init(&data->guard, NULL);
 	pthread_cond_init(&data->submit, NULL);
 	
-	int error = pthread_create(&data->_thread, &uring_submission_thread, data);
+	int error = pthread_create(&data->thread, NULL, uring_submission_thread, data);
 	
 	if (!error) {
-		data->thread = &data->_thread;
+		data->thread = 0;
 	} else {
 		rb_sys_fail("start_submission_thread:pthread_create");
 	}
@@ -149,18 +148,18 @@ void start_submission_thread(struct Event_Backend_URing *data) {
 
 inline static
 void submit_lock(struct Event_Backend_URing *data) {
-	pthread_mutex_lock(data->guard);
+	pthread_mutex_lock(&data->guard);
 }
 
 inline static
 void submit_unlock(struct Event_Backend_URing *data) {
-	pthread_mutex_unlock(data->guard);
+	pthread_mutex_unlock(&data->guard);
 }
 
 inline static
 void submit_unlock_signal(struct Event_Backend_URing *data) {
-	pthread_mutex_unlock(data->guard);
-	pthread_cond_signal(data->submit);
+	pthread_mutex_unlock(&data->guard);
+	pthread_cond_signal(&data->submit);
 }
 
 VALUE Event_Backend_URing_initialize(VALUE self, VALUE loop) {
@@ -485,10 +484,12 @@ static
 void * select_internal(void *_arguments) {
 	struct select_arguments * arguments = (struct select_arguments *)_arguments;
 	
+	submit_lock(arguments->data);
 	io_uring_submit(&arguments->data->ring);
 	
 	struct io_uring_cqe *cqe = NULL;
 	arguments->result = io_uring_wait_cqe_timeout(&arguments->data->ring, &cqe, arguments->timeout);
+	submit_unlock(arguments->data);
 	
 	return NULL;
 }
