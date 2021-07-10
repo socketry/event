@@ -107,6 +107,14 @@ VALUE Event_Backend_URing_allocate(VALUE self) {
 }
 
 static
+void check(const char * message, int error) {
+	if (error) {
+		perror(message);
+		abort();
+	}
+}
+
+static
 void uring_submission_thread_cleanup(void *_data) {
 	struct Event_Backend_URing *data = data;
 	
@@ -134,8 +142,13 @@ static
 void start_submission_thread(struct Event_Backend_URing *data) {
 	rb_update_max_fd(data->ring.ring_fd);
 	
-	pthread_mutex_init(&data->guard, NULL);
-	pthread_cond_init(&data->submit, NULL);
+	check("start_submission_thread:pthread_mutex_init", 
+		pthread_mutex_init(&data->guard, NULL)
+	);
+	
+	check("start_submission_thread:pthread_cond_init",
+		pthread_cond_init(&data->submit, NULL)
+	);
 	
 	int error = pthread_create(&data->thread, NULL, uring_submission_thread, data);
 	
