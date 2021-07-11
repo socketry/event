@@ -26,6 +26,8 @@
 #include <ruby/io/buffer.h>
 #endif
 
+#include <time.h>
+
 enum Event {
 	READABLE = 1,
 	PRIORITY = 2,
@@ -59,3 +61,8 @@ VALUE Event_Backend_process_status_wait(rb_pid_t pid);
 int Event_Backend_nonblock_set(int file_descriptor);
 void Event_Backend_nonblock_restore(int file_descriptor, int flags);
 
+void Event_Backend_elapsed_time(struct timespec* start, struct timespec* stop, struct timespec *duration);
+void Event_Backend_current_time(struct timespec *time);
+
+#define PRINTF_TIMESPEC "%lld.%.9ld"
+#define PRINTF_TIMESPEC_ARGS(ts) (long long)((ts).tv_sec), (ts).tv_nsec

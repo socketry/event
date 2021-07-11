@@ -85,3 +85,18 @@ void Init_Event_Backend(VALUE Event_Backend) {
 	rb_Process_Status = rb_const_get_at(rb_mProcess, rb_intern("Status"));
 #endif
 }
+
+void Event_Backend_elapsed_time(struct timespec* start, struct timespec* stop, struct timespec *duration)
+{
+	if ((stop->tv_nsec - start->tv_nsec) < 0) {
+		duration->tv_sec = stop->tv_sec - start->tv_sec - 1;
+		duration->tv_nsec = stop->tv_nsec - start->tv_nsec + 1000000000;
+	} else {
+		duration->tv_sec = stop->tv_sec - start->tv_sec;
+		duration->tv_nsec = stop->tv_nsec - start->tv_nsec;
+	}
+}
+
+void Event_Backend_current_time(struct timespec *time) {
+	clock_gettime(CLOCK_MONOTONIC, time);
+}
