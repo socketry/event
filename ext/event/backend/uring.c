@@ -121,6 +121,8 @@ void submission_thread_cleanup(void *_data) {
 	pthread_mutex_unlock(&data->guard);
 }
 
+
+
 static
 void *submission_thread(void *_data) {
 	struct Event_Backend_URing *data = _data;
@@ -128,10 +130,17 @@ void *submission_thread(void *_data) {
 	pthread_mutex_lock(&data->guard);
 	pthread_cleanup_push(submission_thread_cleanup, _data);
 	
+	struct timespec start, stop, duration;
+	
 	while (true) {
 		pthread_cond_wait(&data->submit, &data->guard);
-		fprintf(stderr, "submitting queue...\n");
+		
+		Event_Backend_current_time(&start);
 		io_uring_submit(&data->ring);
+		Event_Backend_current_time(&stop);
+		
+		Event_Backend_elapsed_time(&start, &stop, &duration);
+		fprintf(stderr, "io_uring_submit:" PRINTF_TIMESPEC "\n", PRINTF_TIMESPEC_ARGS(duration));
 	}
 	
 	pthread_cleanup_pop(1);
