@@ -115,21 +115,22 @@ void check(const char * message, int error) {
 }
 
 static
-void uring_submission_thread_cleanup(void *_data) {
+void submission_thread_cleanup(void *_data) {
 	struct Event_Backend_URing *data = data;
 	
 	pthread_mutex_unlock(&data->guard);
 }
 
 static
-void *uring_submission_thread(void *_data) {
-	struct Event_Backend_URing *data = data;
+void *submission_thread(void *_data) {
+	struct Event_Backend_URing *data = _data;
 	
 	pthread_mutex_lock(&data->guard);
-	pthread_cleanup_push(uring_submission_thread_cleanup, _data);
+	pthread_cleanup_push(submission_thread_cleanup, _data);
 	
 	while (true) {
 		pthread_cond_wait(&data->submit, &data->guard);
+		fprintf(stderr, "submitting queue...\n");
 		io_uring_submit(&data->ring);
 	}
 	
@@ -140,8 +141,6 @@ void *uring_submission_thread(void *_data) {
 
 static
 void start_submission_thread(struct Event_Backend_URing *data) {
-	rb_update_max_fd(data->ring.ring_fd);
-	
 	check("start_submission_thread:pthread_mutex_init", 
 		pthread_mutex_init(&data->guard, NULL)
 	);
@@ -150,7 +149,7 @@ void start_submission_thread(struct Event_Backend_URing *data) {
 		pthread_cond_init(&data->submit, NULL)
 	);
 	
-	int error = pthread_create(&data->thread, NULL, uring_submission_thread, data);
+	int error = pthread_create(&data->thread, NULL, submission_thread, data);
 	
 	if (!error) {
 		data->thread = 0;
@@ -186,6 +185,8 @@ VALUE Event_Backend_URing_initialize(VALUE self, VALUE loop) {
 	if (result < 0) {
 		rb_syserr_fail(-result, "Event_Backend_URing_initialize:io_uring_queue_init");
 	}
+	
+	rb_update_max_fd(data->ring.ring_fd);
 	
 	start_submission_thread(data);
 	
