@@ -36,7 +36,13 @@
 	<section>
 	<h2>Definitions</h2>
 	
-	<section id="Event::Selector::Select#resume"><h3><code class="language-ruby">def resume(fiber, *arguments)</code></h3><p>Transfer from the current fiber to the specified fiber. Put the current fiber into the ready list.</p>
+	<section id="Event::Selector::Select#transfer"><h3><code class="language-ruby">def transfer</code></h3><p>Transfer from the current fiber to the event loop.</p>
+<details>
+						<summary><h4>Implementation</h4></summary>
+						<pre><code class="language-ruby">def transfer
+	@loop.transfer
+end</code></pre>
+					</details></section><section id="Event::Selector::Select#resume"><h3><code class="language-ruby">def resume(fiber, *arguments)</code></h3><p>Transfer from the current fiber to the specified fiber. Put the current fiber into the ready list.</p>
 <details>
 						<summary><h4>Implementation</h4></summary>
 						<pre><code class="language-ruby">def resume(fiber, *arguments)
